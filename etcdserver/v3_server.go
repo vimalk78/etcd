@@ -95,15 +95,18 @@ type Authenticator interface {
 
 func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeResponse, error) {
 	// TODO: remove this checking when we release etcd 3.2
+	trange := time.Now()
 	if s.ClusterVersion() == nil || s.ClusterVersion().LessThan(newRangeClusterVersion) {
 		return s.legacyRange(ctx, r)
 	}
 
 	if !r.Serializable {
+		t1 := time.Now()
 		err := s.linearizableReadNotify(ctx)
 		if err != nil {
 			return nil, err
 		}
+		plog.Errorf("waiting linearizable %v", time.Since(t1))
 	}
 	var resp *pb.RangeResponse
 	var err error
@@ -114,6 +117,7 @@ func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRe
 	if serr := s.doSerialize(ctx, chk, get); serr != nil {
 		return nil, serr
 	}
+	plog.Errorf("returning Range in %v", time.Since(trange))
 	return resp, err
 }
 
@@ -770,13 +774,15 @@ func (s *EtcdServer) linearizableReadLoop() {
 		case <-s.stopping:
 			return
 		}
+		trecv := time.Now()
 
 		nextnr := newNotifier()
-
-		s.readMu.Lock()
 		nr := s.readNotifier
-		s.readNotifier = nextnr
-		s.readMu.Unlock()
+		switchNotifier := func() {
+			s.readMu.Lock()
+			s.readNotifier = nextnr
+			s.readMu.Unlock()
+		}
 
 		cctx, cancel := context.WithTimeout(context.Background(), internalTimeout)
 		if err := s.r.ReadIndex(cctx, ctx); err != nil {
@@ -785,6 +791,7 @@ func (s *EtcdServer) linearizableReadLoop() {
 				return
 			}
 			plog.Errorf("failed to get read index from raft: %v", err)
+			switchNotifier()
 			nr.notify(err)
 			continue
 		}
@@ -803,8 +810,10 @@ func (s *EtcdServer) linearizableReadLoop() {
 					// continue waiting for the response of the current requests.
 					plog.Warningf("ignored out-of-date read index response (want %v, got %v)", rs.RequestCtx, ctx)
 				}
+				plog.Errorf("reading readStateC took %v", time.Since(trecv))
 			case <-time.After(internalTimeout):
 				plog.Warningf("timed out waiting for read index response")
+				switchNotifier()
 				nr.notify(ErrTimeout)
 				timeout = true
 			case <-s.stopping:
@@ -813,9 +822,12 @@ func (s *EtcdServer) linearizableReadLoop() {
 		}
 		if !done {
 			continue
+		} else {
+			switchNotifier()
 		}
 
 		if ai := s.getAppliedIndex(); ai < rs.Index {
+			plog.Errorf("waiting for %d to be applied, current %d", rs.Index, ai)
 			select {
 			case <-s.applyWait.Wait(rs.Index):
 			case <-s.stopping:
